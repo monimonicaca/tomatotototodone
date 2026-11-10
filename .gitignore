@@ -1,0 +1,9 @@
+# ---- 个人运行数据（不上库）----
+config.json
+todos.db
+run.lock
+
+# ---- Python 缓存 / 临时 ----
+__pycache__/
+*.py[cod]
+.temp/
