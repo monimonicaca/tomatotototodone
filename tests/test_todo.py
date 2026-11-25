@@ -59,6 +59,48 @@ def test_remove_clears_active():
     assert len(tl.items) == 1
 
 
+def test_edit_updates_text_and_note():
+    tl = TodoList()
+    t = tl.add("旧标题", "旧详情")
+    assert tl.edit(t.id, "  新标题", "  新详情  ") is t
+    assert t.text == "新标题" and t.note == "新详情"
+    assert tl.edit(t.id, "   ") is None             # 空标题忽略，不修改
+    assert t.text == "新标题"
+    assert tl.edit("不存在", "短") is None              # 不存在条目静默
+    tl.edit(t.id, "x" * 100, "y" * 500)              # 限长
+    assert t.text == "x" * 60 and t.note == "y" * 200
+
+
+def test_progress_set_and_clamp():
+    from tomato.constants import clean_progress
+    tl = TodoList()
+    a = tl.add("带进度", progress=80)
+    assert a.progress == 80
+    assert tl.add("超界", progress=150).progress == 100   # 上界钳制
+    assert tl.add("负值", progress=-30).progress == 0     # 下界钳制
+    assert tl.add("垃圾", progress="abc").progress == 0   # 坏数据回 0
+    tl.set_progress(a.id, "45")
+    assert a.progress == 45
+    tl.set_progress("不存在", 50)                          # 静默
+    assert clean_progress("80.9") == 80                   # 小数截断
+
+
+def test_progress_edit_and_roundtrip():
+    tl = TodoList()
+    t = tl.add("可编辑进度")
+    tl.edit(t.id, "改名", "说明", progress=90)
+    assert t.progress == 90
+    tl.edit(t.id, "只改字")                    # 不传 progress：进度不动
+    assert t.progress == 90
+    tl2 = TodoList.from_dict(tl.as_dict())
+    assert tl2.items[0].progress == 90                   # 持久化往返
+    tl3 = TodoList.from_dict({"items": [
+        {"id": "p1", "text": "ok", "progress": "999"},   # 坏数据钳制
+        {"id": "p2", "text": "ok2"},                     # 缺省 0
+    ]})
+    assert tl3.items[0].progress == 100 and tl3.items[1].progress == 0
+
+
 def test_rollover_drops_done_keeps_pending():
     tl = TodoList()
     a = tl.add("完成A")

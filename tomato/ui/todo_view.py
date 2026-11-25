@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
-"""今日待办面板：添加 / 选中 / 开始番茄 / 完成 / 删除 + 按天归档浏览。
+"""今日待办面板：添加 / 选中 / 开始番茄 / 完成 / 删除 / 编辑完成度 + 按天归档浏览。
 
 视图不持有业务状态：所有动作通过 TodoHandlers 回调给 controller，
 列表数据直接读传入的 TodoList，refresh() 随取随画。
 
+面板放大到 420x560：每条待办双行布局（上行文字 + 行内按钮，
+下行完成度进度条 + 百分比 + 番茄数），全部功能一屏可见。
+
 两种形态（set_list 切换）：
 - 今日（editable=True）：完整交互；
 - 历史档案（editable=False）：只读快照——无输入行、无行按钮、不可选中，
-  底部提示换为"历史归档·只读"。
+  底部提示换为"历史归档·只读"。完成度仅展示不可改。
 """
 from __future__ import annotations
 
@@ -15,44 +18,50 @@ import tkinter as tk
 from dataclasses import dataclass
 from tkinter import END
 
+from ..constants import clean_progress
 from ..theme import Theme
 from ..todo import TodoList
 from .canvas_helpers import fit_text, round_rect, text_width
 from .window import clamp_to_screen
 
-W, H = 330, 430
+W, H = 420, 560
+PANEL_W, PANEL_H = W, H                  # 供 controller 定位引用（防硬编码漂移）
 CARD = (12, 8, W - 12, H - 8, 24)
-LIST_TOP, LIST_BOT = 118, H - 50        # 列表区可视范围
-ROW = 34                                 # 单行高
+LIST_TOP, LIST_BOT = 62, H - 70          # 列表区可视范围
+ROW = 44                                 # 单条目高（双行：文字 + 完成度条）
 X_TEXT = 52                              # 文本起点
-BTN_X = {"start": 96, "done": 64, "del": 36}   # 距右边缘
-# 输入区（今日形态）：任务行 + 详情行，右侧按钮跨两行
-ENTRY_Y, ENTRY_H = 56, 24               # 任务输入框
-NOTE_LABEL = (34, 94)                    # “详情”小标签
-NOTE_ENTRY = (50, 84, 180, 24)          # 详情输入框
-ADD_BTN = (230, 56, 70, 56)             # 添加按钮（覆盖两行）
+BTN_X = {"detail": 114, "start": 88, "done": 62, "del": 36}   # 距右边缘
+ADD_BTN = (W - 118, H - 56, 100, 40)     # 添加按钮（右下角）：x,y,宽,高
+HINT_Y = H - 32                          # 底部提示基线
+HINT_MAX_W = 268                         # 提示文字最大宽（让开右下角按钮）
 WEEKHINT_FONT = ("Segoe UI", 8)
 TEXT_FONT = ("Segoe UI", 9)
+PCT_FONT = ("Segoe UI", 8, "bold")       # 完成度百分比 / 番茄次数
 ICON_FONT = ("Segoe UI Symbol", 12, "bold")   # 行内图标：细笔画字形需大号加粗才抗锯齿后仍清晰
 HEADER_FONT = ("Segoe UI", 13, "bold")
 SUB_FONT = ("Segoe UI", 8, "bold")
 NAV_FONT = ("Segoe UI Symbol", 10, "bold")
 DATE_FONT = ("Segoe UI", 8, "bold")
 # 导航簇（副标题行右侧）：◀ 日期 ▶
-NAV_PREV_X, NAV_DATE_X, NAV_NEXT_X, NAV_Y = 214, 252, 294, 44
+NAV_PREV_X, NAV_DATE_X, NAV_NEXT_X, NAV_Y = W - 116, W - 78, W - 36, 44
+# 单条目完成度条（第二行）
+BAR_X1, BAR_X2 = X_TEXT, W - 142         # 轨道范围
+PCT_X = W - 130                          # 百分比文字起点
+POMS_X = W - 70                          # 番茄图标中线
 
-HINT_TODAY = "点条目选中任务 · ▶ 开始番茄 · ✓ 完成（计时中自动结束） · ✕ 删除 · 双击看详情"
-HINT_ARCHIVE = "历史归档 · 只读（✔ 为当天已完成项，番茄数为截至当天累计） · 双击看详情"
+HINT_TODAY = "点条目选中 · ▶ 开始 · ✔ 完成 · ✕ 删除 · ⋯ 详情/编辑（可改完成度）· 右下添加"
+HINT_ARCHIVE = "历史归档 · 只读（✔ 为已完成） · ⋯ 详情"
 
 
 @dataclass
 class TodoHandlers:
     """视图 -> controller 的回调集合。"""
-    on_add: callable          # (text, note)
+    on_add: callable          # (text, note, progress)
     on_select: callable       # (todo_id)
     on_start: callable        # (todo_id)
     on_toggle_done: callable  # (todo_id)
     on_remove: callable       # (todo_id)
+    on_edit: callable         # (todo_id, text, note, progress)
     on_close: callable        # ()
     on_prev_day: callable     # ()  浏览更早一天
     on_next_day: callable     # ()  浏览更近一天（直到今天）
@@ -77,6 +86,7 @@ class TodoView:
         self.editable = True
         self._offset = 0
         self._drag_state = None
+        self._children = []      # 面板打开的子弹窗（详情/新建），随面板关闭一并销毁
 
         self.win = tk.Toplevel(root)
         self.win.title("番茄钟·待办")
@@ -130,40 +140,18 @@ class TodoView:
         cv.tag_bind(self._nav_next_id, "<Button-1>",
                     lambda e: self.h.on_next_day())
 
-        # 输入区（Entry/Button 是 tk 部件，place 覆盖在画布上；档案态隐藏）
-        self.entry = tk.Entry(self.win, font=TEXT_FONT, bg=th.card, fg=th.ink,
-                              insertbackground=th.ink, relief="flat",
-                              highlightthickness=1,
-                              highlightbackground=th.pill_active,
-                              highlightcolor=th.lavender_deep)
-        self.entry.place(in_=self.cv, x=26, y=ENTRY_Y, width=196,
-                         height=ENTRY_H)
-        add_btn = tk.Button(self.win, text="添加", font=TEXT_FONT,
-                            bg=th.lavender, fg=th.btn_ink, relief="flat",
-                            activebackground=th.pill_active,
-                            command=self._add_from_entry)
-        add_btn.place(in_=self.cv, x=ADD_BTN[0], y=ADD_BTN[1],
-                      width=ADD_BTN[2], height=ADD_BTN[3])
-        self._add_btn = add_btn
-        self.entry.bind("<Return>", lambda e: self._add_from_entry())
-
-        # 详情输入行：任务可附带一句话说明（可选）
-        self._note_label_id = cv.create_text(NOTE_LABEL[0], NOTE_LABEL[1],
-                                             text="详情", font=WEEKHINT_FONT,
-                                             fill=th.faint, anchor="w")
-        self.note_entry = tk.Entry(self.win, font=TEXT_FONT, bg=th.card,
-                                   fg=th.muted, insertbackground=th.ink,
-                                   relief="flat", highlightthickness=1,
-                                   highlightbackground=th.pill_active,
-                                   highlightcolor=th.lavender_deep)
-        self.note_entry.place(in_=self.cv, x=NOTE_ENTRY[0], y=NOTE_ENTRY[1],
-                              width=NOTE_ENTRY[2], height=NOTE_ENTRY[3])
-        self.note_entry.bind("<Return>", lambda e: self._add_from_entry())
-
         # 底部提示（set_list 切换文案）
-        self._hint_id = cv.create_text(28, H - 30, text=HINT_TODAY,
+        self._hint_id = cv.create_text(28, HINT_Y, text=HINT_TODAY,
                                        font=WEEKHINT_FONT, fill=th.faint,
                                        anchor="w")
+
+        # 右下角「添加」按钮：点开新建待办弹窗（档案态隐藏）
+        self._add_btn = tk.Button(
+            self.win, text="＋ 添加", font=("Segoe UI", 10, "bold"),
+            bg=th.lavender, fg=th.btn_ink, relief="flat",
+            activebackground=th.pill_active, command=self._open_add_dialog)
+        self._add_btn.place(in_=self.cv, x=ADD_BTN[0], y=ADD_BTN[1],
+                            width=ADD_BTN[2], height=ADD_BTN[3])
 
         # 列表滚轮
         self.win.bind("<MouseWheel>", self._on_wheel)
@@ -185,7 +173,9 @@ class TodoView:
         cv.itemconfig(self._nav_date_id,
                       text=label if isinstance(label, str) else "")
         cv.itemconfig(self._hint_id,
-                      text=HINT_TODAY if editable else HINT_ARCHIVE)
+                      text=fit_text(cv,
+                                    HINT_TODAY if editable else HINT_ARCHIVE,
+                                    WEEKHINT_FONT, HINT_MAX_W))
 
         # 导航簇：无历史整体隐藏；不可用方向置灰
         state = "normal" if nav and nav.visible else "hidden"
@@ -199,33 +189,22 @@ class TodoView:
                       fill=th.lavender_ink if nav and nav.has_next
                       else th.faint)
 
-        # 输入行只在今日形态出现
+        # 添加按钮只在今日形态出现
         if self.editable:
-            self.entry.place(in_=self.cv, x=26, y=ENTRY_Y, width=196,
-                             height=ENTRY_H)
             self._add_btn.place(in_=self.cv, x=ADD_BTN[0], y=ADD_BTN[1],
                                 width=ADD_BTN[2], height=ADD_BTN[3])
-            self.note_entry.place(in_=self.cv, x=NOTE_ENTRY[0],
-                                  y=NOTE_ENTRY[1], width=NOTE_ENTRY[2],
-                                  height=NOTE_ENTRY[3])
-            cv.itemconfigure(self._note_label_id, state="normal")
         else:
-            self.entry.place_forget()
             self._add_btn.place_forget()
-            self.note_entry.place_forget()
-            cv.itemconfigure(self._note_label_id, state="hidden")
 
         self.refresh()
 
-    def _add_from_entry(self):
+    def _open_add_dialog(self):
         if not self.editable:
             return
-        text = self.entry.get()
-        note = self.note_entry.get()
-        self.entry.delete(0, END)
-        self.note_entry.delete(0, END)
-        if text.strip():
-            self.h.on_add(text, note)
+        x = self.win.winfo_x() + (W - TodoFormDialog.W) // 2
+        y = self.win.winfo_y() + 40
+        dlg = TodoFormDialog(self.win, self.theme, self.h.on_add, pos=(x, y))
+        self._children.append(dlg)
 
     # ---------- 渲染 ----------
     def refresh(self):
@@ -252,16 +231,17 @@ class TodoView:
 
     def _draw_row(self, todo, y):
         cv, th = self.cv, self.theme
-        yc = y + ROW // 2
+        yc1 = y + 15                          # 第一行：文本 + 行内按钮
+        yc2 = y + 33                          # 第二行：完成度条 + 番茄数
         active = (todo.id == self.todos.active_id)
 
         # 行背景既是状态底色，也是"点行选中"的命中区（仅今日形态可点）
         if active:
-            bg = round_rect(cv, 20, y + 2, W - 20, y + ROW - 2, 10,
+            bg = round_rect(cv, 20, y + 2, W - 20, y + ROW - 2, 12,
                             fill=th.pill_active, outline=th.lavender_deep,
                             width=1, tags="row")
         else:
-            bg = round_rect(cv, 20, y + 2, W - 20, y + ROW - 2, 10,
+            bg = round_rect(cv, 20, y + 2, W - 20, y + ROW - 2, 12,
                             fill=th.card, width=0, tags="row")
         if self.editable:
             cv.tag_bind(bg, "<Button-1>",
@@ -269,46 +249,67 @@ class TodoView:
         # 双击任意处查看该条详情（今日/档案皆可）
         self._bind_detail(bg, todo)
 
-        # 状态标记（✔ 为粗笔画字形，细的 ✓ 抗锯齿后视觉上太淡）
+        # 状态标记（整条目垂直居中；✔ 为粗笔画字形，细的 ✓ 太淡）
         if todo.done:
             state, color = "✔", th.mint_ink
         elif active:
             state, color = "●", th.pink_ink
         else:
             state, color = "○", th.lavender_deep
-        cv.create_text(36, yc, text=state,
+        cv.create_text(36, y + ROW // 2, text=state,
                        font=ICON_FONT, fill=color, tags="row")
 
-        # 文本 + 完成删除线
-        text = fit_text(cv, todo.text, TEXT_FONT, W - 150 - X_TEXT)
-        text_id = cv.create_text(X_TEXT, yc, text=text, font=TEXT_FONT,
+        # 文本 + 完成删除线（第一行）
+        text = fit_text(cv, todo.text, TEXT_FONT, W - 126 - X_TEXT)
+        text_id = cv.create_text(X_TEXT, yc1, text=text, font=TEXT_FONT,
                                  fill=(th.faint if todo.done else th.ink),
                                  anchor="w", tags="row")
         self._bind_detail(text_id, todo)
         if todo.done:
             tw = text_width(cv, text, TEXT_FONT)
-            cv.create_line(X_TEXT - 2, yc, X_TEXT + tw + 2, yc,
+            cv.create_line(X_TEXT - 2, yc1, X_TEXT + tw + 2, yc1,
                            fill=th.faint, width=1, tags="row")
 
-        # 番茄小图标 + 次数
-        if todo.poms > 0:
-            self._mini_tomato(W - 128, yc)
-            cv.create_text(W - 119, yc, text=str(todo.poms),
-                           font=TEXT_FONT, fill=th.muted, anchor="w",
-                           tags="row")
+        # 完成度（第二行）：轨道 + 填充 + 百分比（0% 只画空轨道）
+        pct = min(100, max(0, int(todo.progress)))
+        bx1, bx2 = BAR_X1, BAR_X2
+        round_rect(cv, bx1, yc2 - 4, bx2, yc2 + 4, 4,
+                   fill=th.track, width=0, tags="row")
+        if todo.done:
+            fill, ink = th.mint, th.mint_ink
+        elif active:
+            fill, ink = th.pink, th.pink_ink
+        else:
+            fill, ink = th.lavender, th.lavender_ink
+        if pct > 0:
+            fw = max(6, int((bx2 - bx1) * pct / 100))
+            round_rect(cv, bx1, yc2 - 4, bx1 + fw, yc2 + 4,
+                       max(1, min(4, fw // 2)),
+                       fill=fill, width=0, tags="row")
+            cv.create_text(PCT_X, yc2, text=f"{pct}%",
+                           font=PCT_FONT, fill=ink, anchor="w", tags="row")
 
+        # 番茄小图标 + 次数（第二行右端）
+        if todo.poms > 0:
+            self._mini_tomato(POMS_X, yc2)
+            cv.create_text(POMS_X + 9, yc2, text=str(todo.poms),
+                           font=PCT_FONT, fill=th.muted, anchor="w", tags="row")
+
+        # 详情按钮（今日/档案都可点，点开该条详情）
+        self._row_btn(cv, "⋯", W - BTN_X["detail"], yc1, th.lavender_ink,
+                      lambda e, t=todo: self._open_detail(t))
         # 行按钮仅今日形态（已完成行提供 ↺ 撤销完成）
         if not self.editable:
             return
         if not todo.done:
-            self._row_btn(cv, "▶", W - BTN_X["start"], yc, th.lavender_ink,
+            self._row_btn(cv, "▶", W - BTN_X["start"], yc1, th.lavender_ink,
                           lambda e, i=todo.id: self.h.on_start(i))
-            self._row_btn(cv, "✔", W - BTN_X["done"], yc, th.mint_ink,
+            self._row_btn(cv, "✔", W - BTN_X["done"], yc1, th.mint_ink,
                           lambda e, i=todo.id: self.h.on_toggle_done(i))
         else:
-            self._row_btn(cv, "↺", W - BTN_X["done"], yc, th.mint_ink,
+            self._row_btn(cv, "↺", W - BTN_X["done"], yc1, th.mint_ink,
                           lambda e, i=todo.id: self.h.on_toggle_done(i))
-        self._row_btn(cv, "✕", W - BTN_X["del"], yc, th.muted,
+        self._row_btn(cv, "✕", W - BTN_X["del"], yc1, th.muted,
                       lambda e, i=todo.id: self.h.on_remove(i))
 
     def _mini_tomato(self, x, y):
@@ -328,9 +329,36 @@ class TodoView:
                          lambda e, t=todo: self._open_detail(t))
 
     def _open_detail(self, todo):
-        x = self.win.winfo_x() + self.W - 60
+        x = self.win.winfo_x() + W - 60
         y = self.win.winfo_y() + 10
-        TodoDetail(self.win, self.theme, todo, pos=(x, y))
+        dlg = TodoDetail(self.win, self.theme, todo, pos=(x, y),
+                         on_edit=lambda: self._open_edit(todo, dlg))
+        self._children.append(dlg)
+
+    def _open_edit(self, todo, detail=None):
+        """从详情里点「编辑」：关掉只读详情，用预填好的编辑表单替换。"""
+        self._close_child(detail)
+        x = self.win.winfo_x() + (W - TodoFormDialog.W) // 2
+        y = self.win.winfo_y() + 40
+        edit = TodoFormDialog(
+            self.win, self.theme,
+            lambda text, note, progress: self.h.on_edit(todo.id, text,
+                                                        note, progress),
+            pos=(x, y), initial_text=todo.text, initial_note=todo.note,
+            initial_progress=todo.progress,
+            title="编辑待办", submit_label="保存")
+        self._children.append(edit)
+
+    def _close_child(self, dlg):
+        """从面板关闭一个子弹窗并从跟踪列表移除（幂等）。"""
+        if dlg is None:
+            return
+        if dlg in self._children:
+            self._children.remove(dlg)
+        try:
+            dlg.close()
+        except Exception:
+            pass
 
     def _glyph(self, cv, glyph, x, y):
         return cv.create_text(x, y, text=glyph, font=NAV_FONT,
@@ -367,6 +395,13 @@ class TodoView:
 
     # ---------- 生命周期 ----------
     def close(self):
+        """关闭面板并级联销毁其打开的子弹窗（详情/新建待办）。"""
+        for dlg in self._children:
+            try:
+                dlg.close()
+            except Exception:
+                pass
+        self._children = []
         try:
             self.win.destroy()
         except tk.TclError:
@@ -374,15 +409,16 @@ class TodoView:
 
 
 class TodoDetail:
-    """单条待办详情弹窗（只读）——展示任务文字与详情说明。
+    """单条待办详情弹窗（只读）——展示任务文字、完成度与详情说明。
 
     独立 Toplevel，可拖动、置顶；双击待办条目时由 TodoView 打开。
     """
     drag_tag = "todo_detail_card"
-    W, H = 320, 210
+    W, H = 320, 240
 
-    def __init__(self, root, theme: Theme, todo, pos=None):
+    def __init__(self, root, theme: Theme, todo, pos=None, on_edit=None):
         self.theme = theme
+        self.on_edit = on_edit
         self._drag_state = None
         self.win = tk.Toplevel(root)
         self.win.title("番茄钟·待办详情")
@@ -410,27 +446,47 @@ class TodoDetail:
                    outline=th.card_edge, width=1, tags=self.drag_tag)
         self._bind_drag(self.drag_tag)
 
-        # 标题：任务名 + 关闭
+        # 标题：任务名 + 编辑 + 关闭
         self.cv.create_text(28, 26, text="●", font=("Segoe UI", 12),
                             fill=th.pink_deep, anchor="w")
         self.cv.create_text(
             46, 26, text=fit_text(self.cv, todo.text, HEADER_FONT,
-                                  self.W - 110),
+                                  self.W - 140),
             font=HEADER_FONT, fill=th.ink, anchor="w")
+        if on_edit is not None:
+            self._icon("✎", self.W - 52, 26, th.lavender_ink, on_edit)  # 编辑
         self._icon("✕", self.W - 26, 26, th.muted, self.close)
 
+        # 完成度：标签 + 条 + 百分比
+        pct = min(100, max(0, int(todo.progress)))
+        if todo.done:
+            bar_fill, bar_ink = th.mint, th.mint_ink
+        else:
+            bar_fill, bar_ink = th.lavender, th.lavender_ink
+        self.cv.create_text(28, 58, text="完成度", font=SUB_FONT,
+                            fill=th.faint, anchor="w")
+        bx1, bx2 = 84, self.W - 110
+        round_rect(self.cv, bx1, 51, bx2, 65, 7, fill=th.track, width=0)
+        if pct > 0:
+            fw = max(8, int((bx2 - bx1) * pct / 100))
+            round_rect(self.cv, bx1, 51, bx1 + fw, 65,
+                       max(1, min(7, fw // 2)), fill=bar_fill, width=0)
+        self.cv.create_text(self.W - 78, 58, text=f"{pct}%",
+                            font=("Segoe UI", 9, "bold"), fill=bar_ink)
+
         # 详情区标签
-        self.cv.create_text(28, 52, text="详情", font=SUB_FONT,
+        self.cv.create_text(28, 86, text="详情", font=SUB_FONT,
                             fill=th.faint, anchor="w")
 
         # 只读正文（自动换行 + 滚动）
+        body_y, body_h = 94, self.H - 110
         self.txt = tk.Text(self.win, font=TEXT_FONT, bg=th.card, fg=th.ink,
                            wrap="word", relief="flat", highlightthickness=0,
                            bd=0, padx=0, pady=0)
         sb = tk.Scrollbar(self.win, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
-        self.txt.place(x=22, y=56, width=self.W - 52, height=self.H - 78)
-        sb.place(x=self.W - 24, y=56, height=self.H - 78)
+        self.txt.place(x=22, y=body_y, width=self.W - 52, height=body_h)
+        sb.place(x=self.W - 24, y=body_y, height=body_h)
         self.txt.insert(END, todo.note if todo.note else "（无详情说明）")
         self.txt.config(state="disabled")
 
@@ -457,6 +513,188 @@ class TodoDetail:
         self.cv.tag_bind(item, "<Button-1>", lambda e: cb())
 
     def close(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
+class TodoFormDialog:
+    """待办表单弹窗（模态）：输入标题 / 完成度 / 详情，
+    确认后回调 on_submit(title, note, progress)。
+
+    新建与编辑共用：编辑时传 initial_* 预填、标题/按钮换文案。
+    完成度用 Spinbox（0-100，步进 5），旁边带一条实时预览进度条。
+    独立 Toplevel，可拖动、置顶；从面板右下「添加」或详情里的「编辑」打开。
+    """
+    drag_tag = "todo_form_card"
+    W, H = 340, 350
+
+    PREV_X1, PREV_X2 = 130, 300          # 完成度预览条轨道范围
+    PREV_TOP, PREV_BOT = 163, 177        # 预览条上下边
+
+    def __init__(self, root, theme: Theme, on_submit, pos=None, *,
+                 initial_text: str = "", initial_note: str = "",
+                 initial_progress: int = 0,
+                 title: str = "新建待办", submit_label: str = "添加"):
+        self.theme = theme
+        self.on_submit = on_submit
+        self._drag_state = None
+        self.win = tk.Toplevel(root)
+        self.win.title("番茄钟·待办")
+        self.win.overrideredirect(True)
+        try:
+            self.win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        bg = theme.card
+        try:
+            self.win.attributes("-transparentcolor", theme.transparent_key)
+            bg = theme.transparent_key
+        except tk.TclError:
+            pass
+        self.cv = tk.Canvas(self.win, width=self.W, height=self.H, bg=bg,
+                            highlightthickness=0, bd=0)
+        self.cv.pack()
+        if pos is None:
+            pos = (0, 0)
+        px, py = clamp_to_screen(pos[0], pos[1], self.W, self.H)
+        self.win.geometry(f"{self.W}x{self.H}+{px}+{py}")
+
+        th = theme
+        # 卡片底
+        round_rect(self.cv, 8, 8, self.W - 8, self.H - 8, 18, fill=th.card,
+                   outline=th.card_edge, width=1, tags=self.drag_tag)
+        self._bind_drag(self.drag_tag)
+
+        # 头部：粉色圆点 + 标题 + 关闭，下接一条细分隔线
+        self.cv.create_text(30, 38, text="●", font=("Segoe UI", 13),
+                            fill=th.pink_deep, anchor="w")
+        self.cv.create_text(48, 38, text=title, font=HEADER_FONT,
+                            fill=th.ink, anchor="w")
+        self._icon("✕", self.W - 28, 38, th.muted, self.close)
+        self.cv.create_line(24, 58, self.W - 24, 58, fill=th.card_edge,
+                            width=1)
+
+        # 标题字段（软填充输入框）
+        self.cv.create_text(30, 88, text="标题", font=SUB_FONT,
+                            fill=th.muted, anchor="w")
+        self.title_entry = tk.Entry(
+            self.win, font=TEXT_FONT, bg=th.pill, fg=th.ink,
+            insertbackground=th.ink, relief="flat", highlightthickness=1,
+            highlightbackground=th.card_edge, highlightcolor=th.lavender_deep)
+        self.title_entry.place(x=30, y=98, width=self.W - 60, height=32)
+        self.title_entry.insert(0, initial_text)
+        self.title_entry.bind("<Return>", lambda e: self._submit())
+
+        # 完成度字段：Spinbox（0-100 步进 5）+ 实时预览条
+        self.cv.create_text(30, 150, text="完成度（%）", font=SUB_FONT,
+                            fill=th.muted, anchor="w")
+        self.progress_var = tk.StringVar(value=str(clean_progress(
+            initial_progress)))
+        spin = tk.Spinbox(
+            self.win, from_=0, to=100, increment=5, width=5,
+            textvariable=self.progress_var, font=TEXT_FONT, bg=th.pill,
+            fg=th.ink, insertbackground=th.ink, relief="flat",
+            buttonbackground=th.pill, highlightthickness=1,
+            highlightbackground=th.card_edge,
+            highlightcolor=th.lavender_deep,
+            command=self._update_preview)
+        spin.place(x=30, y=160, width=78, height=30)
+        spin.bind("<KeyRelease>", lambda e: self._update_preview())
+        round_rect(self.cv, self.PREV_X1, self.PREV_TOP,
+                   self.PREV_X2, self.PREV_BOT, 7,
+                   fill=th.track, width=0)
+        self._preview_fill = None
+        self._update_preview()
+
+        # 详情字段（多行，柔和底）
+        self.cv.create_text(30, 212, text="详情（可选）", font=SUB_FONT,
+                            fill=th.muted, anchor="w")
+        self.detail_text = tk.Text(
+            self.win, font=TEXT_FONT, bg=th.pill, fg=th.ink,
+            insertbackground=th.ink, wrap="word", relief="flat",
+            highlightthickness=1, highlightbackground=th.card_edge,
+            highlightcolor=th.lavender_deep)
+        self.detail_text.place(x=30, y=222, width=self.W - 60, height=56)
+        self.detail_text.insert("1.0", initial_note)
+
+        # 底部按钮（与详情框留足间距，不重叠）
+        cancel = tk.Button(self.win, text="取消", font=TEXT_FONT, bg=th.pill,
+                           fg=th.muted, relief="flat",
+                           activebackground=th.pill_active,
+                           command=self.close)
+        cancel.place(x=self.W - 154, y=self.H - 46, width=56, height=30)
+        submit = tk.Button(self.win, text=submit_label,
+                           font=("Segoe UI", 10, "bold"), bg=th.lavender,
+                           fg=th.btn_ink, relief="flat",
+                           activebackground=th.pill_active,
+                           command=self._submit)
+        submit.place(x=self.W - 90, y=self.H - 46, width=60, height=30)
+
+        self._focus_title()
+        try:
+            self.win.grab_set()          # 模态：必须先关本窗才能操作面板
+        except tk.TclError:
+            pass
+
+    def _focus_title(self):
+        self.title_entry.focus_set()
+        self.title_entry.icursor(END)
+
+    def _update_preview(self):
+        """重画完成度预览条的填充（值变了就删旧画新，永远叠在轨道上方）。"""
+        cv, th = self.cv, self.theme
+        if self._preview_fill is not None:
+            cv.delete(self._preview_fill)
+            self._preview_fill = None
+        pct = clean_progress(self.progress_var.get())
+        w = int((self.PREV_X2 - self.PREV_X1) * pct / 100)
+        if w > 2:
+            self._preview_fill = round_rect(
+                cv, self.PREV_X1, self.PREV_TOP,
+                self.PREV_X1 + w, self.PREV_BOT,
+                max(1, min(7, w // 2)),
+                fill=th.lavender, width=0)
+
+    def _submit(self):
+        title = self.title_entry.get().strip()
+        note = self.detail_text.get("1.0", END).strip()
+        progress = clean_progress(self.progress_var.get())
+        if title:
+            try:
+                self.on_submit(title, note, progress)
+            except Exception:
+                pass
+            self.close()
+
+    # ---------- 拖拽 ----------
+    def _bind_drag(self, tag):
+        self.cv.tag_bind(tag, "<Button-1>", self._press)
+        self.cv.tag_bind(tag, "<B1-Motion>", self._dragging)
+
+    def _press(self, event):
+        self._drag_state = (event.x_root - self.win.winfo_x(),
+                            event.y_root - self.win.winfo_y())
+
+    def _dragging(self, event):
+        if not self._drag_state:
+            return
+        dx, dy = self._drag_state
+        x, y = clamp_to_screen(event.x_root - dx, event.y_root - dy,
+                               self.W, self.H)
+        self.win.geometry(f"+{x}+{y}")
+
+    def _icon(self, glyph, x, y, color, cb):
+        item = self.cv.create_text(x, y, text=glyph, font=ICON_FONT,
+                                   fill=color)
+        self.cv.tag_bind(item, "<Button-1>", lambda e: cb())
+
+    def close(self):
+        try:
+            self.win.grab_release()
+        except tk.TclError:
+            pass
         try:
             self.win.destroy()
         except tk.TclError:

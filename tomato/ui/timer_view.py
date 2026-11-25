@@ -24,7 +24,7 @@ START_HALF_W, START_HALF_H = 64, 21         # 主按钮药丸半径
 FOOT_Y = 378                                # 底部统计行
 BRAND_FONT = ("Segoe UI", 14, "bold")       # 左上角品牌/任务标题
 BRAND_SUB_FONT = ("Segoe UI", 8, "bold")
-BRAND_MAX_W = 150                           # 标题最大宽度（不覆盖 ☰ 图标区）
+BRAND_MAX_W = 130                           # 标题最大宽度（不覆盖右上角图标区）
 
 
 @dataclass
@@ -37,6 +37,7 @@ class TimerHandlers:
     on_open_settings: Callable[[], None]
     on_open_todos: Callable[[], None]
     on_toggle_pin: Callable[[], None]
+    on_collapse: Callable[[], None]
     on_close: Callable[[], None]
 
 
@@ -99,10 +100,12 @@ class TimerView:
         self._brand_sub_id = cv.create_text(
             58, 44, text="FOCUS · POMODORO", font=BRAND_SUB_FONT,
             fill=th.faint, anchor="w")
-        self._top_icon(cv, "☰", W - 116, 30, self.h.on_open_todos)  # 待办
-        self._pin_ids = self._draw_pin(cv, W - 90, 30)               # 固定
-        self._top_icon(cv, "⚙", W - 64, 30, self.h.on_open_settings)
-        self._top_icon(cv, "✕", W - 38, 30, self.h.on_close)        # 退出
+        # 右上角图标（自右向左：退出 / 设置 / 折叠 / 固定 / 待办）
+        self._top_icon(cv, "✕", W - 36, 30, self.h.on_close)        # 退出
+        self._top_icon(cv, "⚙", W - 60, 30, self.h.on_open_settings)
+        self._top_icon(cv, "⤢", W - 86, 30, self.h.on_collapse)     # 折叠成迷你小窗
+        self._pin_ids = self._draw_pin(cv, W - 114, 30)              # 固定
+        self._top_icon(cv, "☰", W - 140, 30, self.h.on_open_todos)  # 待办
 
         # 进度环（轨道为完整圆；进度环首次 render 时创建）
         self._ring_bbox = (CX - R, CY - R, CX + R, CY + R)
@@ -214,25 +217,33 @@ class TimerView:
 
     # ---------- 图钉（固定置顶）----------
     def _draw_pin(self, cv, x, y):
-        """自绘图钉：针头圆 + 针身线。矢量绘制保证两个状态都能自由着色。"""
-        head = cv.create_oval(x - 4, y - 8, x + 4, y, width=1.5)
-        needle = cv.create_line(x, y - 1, x, y + 6, width=1.5,
-                                capstyle="round")
-        for item in (head, needle):
+        """自绘「图钉」按钮：药丸底 + 针头圆 + 针身线。
+
+        整体是一个完整按钮（药丸底给出足够的命中区，避免小图钉点不准、
+        误触卡片拖拽）——三件都绑定切换置顶。
+        """
+        th = self.theme
+        pill = round_rect(cv, x - 14, y - 10, x + 14, y + 10, 8,
+                          fill=th.pill, outline=th.card_edge, width=1)
+        head = cv.create_oval(x - 4, y - 7, x + 4, y + 1, width=1.5)
+        needle = cv.create_line(x, y, x, y + 6, width=1.5, capstyle="round")
+        for item in (pill, head, needle):
             cv.tag_bind(item, "<Button-1>",
                         lambda e: self.h.on_toggle_pin())
-        return (head, needle)
+        return (pill, head, needle)
 
     def _style_pin(self, pinned: bool):
-        """固定中：粉紫实心；未固定：灰色空心。"""
+        """固定中：薰衣实心底 + 深色图钉；未固定：浅灰空心针。"""
         cv, th = self.cv, self.theme
-        head, needle = self._pin_ids
+        pill, head, needle = self._pin_ids
         if pinned:
-            cv.itemconfig(head, fill=th.pink_deep, outline=th.pink_deep)
-            cv.itemconfig(needle, fill=th.pink_deep)
+            cv.itemconfig(pill, fill=th.pink_deep, outline=th.pink_deep)
+            cv.itemconfig(head, fill=th.btn_ink, outline=th.btn_ink)
+            cv.itemconfig(needle, fill=th.btn_ink)
         else:
-            cv.itemconfig(head, fill="", outline=th.faint)
-            cv.itemconfig(needle, fill=th.faint)
+            cv.itemconfig(pill, fill=th.pill, outline=th.card_edge)
+            cv.itemconfig(head, fill="", outline=th.muted)
+            cv.itemconfig(needle, fill=th.muted)
 
     # ---------- 工具 ----------
     def _top_icon(self, cv, glyph, x, y, cb):

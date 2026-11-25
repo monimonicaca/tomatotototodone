@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """待办的 SQLite 持久化层（todos.db）——按天归档。
 
-设计（schema v2）：
+设计（schema v3：v2 基础上 todos 增加 progress 列）：
     todos     (day, id) 复合主键 —— 每天一个"桶"，互不干扰；
               同一任务跨天顺延时沿用同一 id，保持任务血缘。
     todo_meta (key, value)        date（当前列表归属日）/ active_id
@@ -13,14 +13,15 @@
 - save() 只写 todos.date 对应的桶（单事务整桶替换），翻看历史永不改写旧桶。
 
 容错：库损坏 -> 转存 *.corrupt.db 保留现场并空库重建；行级脏数据丢弃不连坐。
-旧 v1 库（无 day 列）在连接时自动迁移到 v2（按 meta date 整体入桶）。
+旧 v1 库（无 day 列）在连接时自动迁移（按 meta date 整体入桶）；
+v2 老库缺 note / progress 列时原地补列，不碰数据。
 """
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 
-from .constants import to_nonneg_int
+from .constants import clean_progress, to_nonneg_int
 from .todo import Todo, TodoList, clean_note, clean_text
 
 SCHEMA = """
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS todos (
     done INTEGER NOT NULL DEFAULT 0,
     poms INTEGER NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
+    progress INTEGER NOT NULL DEFAULT 0,
     seq  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, id)
 );
@@ -69,13 +71,19 @@ class TodoStore:
     def _ensure_schema(self, conn: sqlite3.Connection):
         cols = [r[1] for r in conn.execute("PRAGMA table_info(todos)")]
         if not cols:
-            conn.executescript(SCHEMA)                    # 全新库
+            conn.executescript(SCHEMA)                    # 全新库（v3）
         elif "day" not in cols:
-            self._migrate_v1_to_v2(conn)                  # 旧库升级
-        elif "note" not in cols:
-            # v2 未带 note 列（旧版本库）：原地补列，不碰数据
-            conn.execute(
-                "ALTER TABLE todos ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+            self._migrate_v1_to_v2(conn)                  # v1：重建为最新结构
+        else:
+            # v2 及以上：缺列原地补（不碰数据）
+            if "note" not in cols:
+                conn.execute(
+                    "ALTER TABLE todos ADD COLUMN "
+                    "note TEXT NOT NULL DEFAULT ''")
+            if "progress" not in cols:
+                conn.execute(
+                    "ALTER TABLE todos ADD COLUMN "
+                    "progress INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_v1_to_v2(self, conn: sqlite3.Connection):
         """v1（无 day 列）-> v2：旧条目按 v1 meta 的 date 整体入桶。"""
@@ -97,10 +105,11 @@ class TodoStore:
             rows = self._clean([tuple(r)[:4] for r in old_rows])
             if rows:
                 conn.executemany(
-                    "INSERT INTO todos (day, id, text, done, poms, note, seq) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [(day, tid, text, done, poms, note, i)
-                     for i, (tid, text, done, poms, note) in enumerate(rows)])
+                    "INSERT INTO todos (day, id, text, done, poms, note, "
+                    "progress, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(day, tid, text, done, poms, note, prog, i)
+                     for i, (tid, text, done, poms, note, prog)
+                     in enumerate(rows)])
         conn.commit()
 
     def close(self):
@@ -170,7 +179,7 @@ class TodoStore:
         day = str(day)
         try:
             rows = self._connection().execute(
-                "SELECT id, text, done, poms, note FROM todos "
+                "SELECT id, text, done, poms, note, progress FROM todos "
                 "WHERE day = ? ORDER BY seq", (day,)).fetchall()
         except sqlite3.DatabaseError:
             self._backup_corrupt()
@@ -179,8 +188,10 @@ class TodoStore:
             return TodoList(date=day)
         tl = TodoList(date=day)
         tl.items = [Todo(id=tid, text=text, done=bool(done),
-                         poms=to_nonneg_int(poms), note=clean_note(note))
-                    for tid, text, done, poms, note in self._clean(rows)]
+                         poms=to_nonneg_int(poms), note=clean_note(note),
+                         progress=clean_progress(prog))
+                    for tid, text, done, poms, note, prog
+                    in self._clean(rows)]
         return tl
 
     def days(self) -> list:
@@ -201,9 +212,10 @@ class TodoStore:
             with conn:
                 conn.execute("DELETE FROM todos WHERE day = ?", (day,))
                 conn.executemany(
-                    "INSERT INTO todos (day, id, text, done, poms, note, seq) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    [(day, t.id, t.text, int(t.done), int(t.poms), t.note, i)
+                    "INSERT INTO todos (day, id, text, done, poms, note, "
+                    "progress, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(day, t.id, t.text, int(t.done), int(t.poms), t.note,
+                      int(t.progress), i)
                      for i, t in enumerate(todos.items)])
                 conn.execute(
                     "INSERT OR REPLACE INTO todo_meta (key, value) "
@@ -222,16 +234,17 @@ class TodoStore:
     # ---------- 工具 ----------
     @staticmethod
     def _clean(rows):
-        """行级清洗：丢掉缺 id / 空文本的脏行，poms 容错转非负整数。
+        """行级清洗：丢掉缺 id / 空文本的脏行，poms/progress 容错。
 
-        输入行可能带或不带 note 列（兼容旧 SELECT），统一清洗为 5 元组。
+        输入行可能带或不带 note/progress 列（兼容旧 SELECT），统一清洗为 6 元组。
         """
         out = []
         for row in rows:
-            rid, text, done, poms, note = (tuple(row) + ("", ""))[:5]
+            rid, text, done, poms, note, prog = \
+                (tuple(row) + ("", "", ""))[:6]
             text = clean_text(text)
             if not isinstance(rid, str) or not rid or not text:
                 continue
             out.append((rid, text, bool(done), to_nonneg_int(poms),
-                        clean_note(note)))
+                        clean_note(note), clean_progress(prog)))
         return out

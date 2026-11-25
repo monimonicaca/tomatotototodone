@@ -22,14 +22,15 @@ from .storage import AppConfig, ConfigStore
 from .theme import Theme
 from .todo import TodoList
 from .todo_store import TodoStore
+from .ui.mini_view import MiniView, H as MINI_H, W as MINI_W
 from .ui.settings_view import SettingsDialog
 from .ui.stats_view import StatsView, make_snapshot
 from .ui.timer_view import TimerHandlers, TimerSnapshot, TimerView
-from .ui.todo_view import NavState, TodoHandlers, TodoView
+from .ui.todo_view import (PANEL_H, PANEL_W, NavState, TodoHandlers,
+                           TodoView)
 from .ui.window import FloatingWindow, clamp_to_screen
 
 TICK_MS = 250   # 刷新节奏；精度由单调时钟保证，与节奏解耦
-TODO_PANEL_W = 330
 
 
 class PomodoroController:
@@ -51,6 +52,7 @@ class PomodoroController:
         self._stickers_on = stickers_on
         self._todo_panel = None
         self._todo_day: str | None = None   # 待办面板正在浏览的日子（None=今日）
+        self._mini = None                   # 迷你折叠窗（None=完整主卡）
         self._deadline: float | None = None
         self._tick_job: str | None = None
 
@@ -71,6 +73,7 @@ class PomodoroController:
                 on_open_settings=self.open_settings,
                 on_open_todos=self.open_todos,
                 on_toggle_pin=self.toggle_pin,
+                on_collapse=self.collapse,
                 on_close=self.exit_app,
             ),
         )
@@ -127,9 +130,55 @@ class PomodoroController:
         """图钉：切换固定置顶（主卡 + 贴纸墙同动，并持久化）。"""
         self._set_topmost(not self.window.topmost)
 
+    # ==================== 折叠 / 展开（迷你窗）====================
+    def collapse(self):
+        """把主卡折叠成迷你小窗：只显示标题 + 剩余时间。
+
+        隐藏主窗，在它原本的位置弹出迷你 Toplevel（仍是主窗的子窗，
+        主窗关闭时会一并销毁）。迷你窗随计时 _render 逐拍刷新。
+        """
+        if self._mini is not None:
+            return
+        x, y = self.window.root.winfo_x(), self.window.root.winfo_y()
+        self._mini = MiniView(
+            self.window.root, self.theme,
+            on_expand=self.expand,
+            on_close=self.exit_app,
+            pos=clamp_to_screen(x, y, MINI_W, MINI_H),
+            topmost=self.window.topmost,
+        )
+        try:
+            self.window.root.withdraw()      # 隐藏主卡
+        except tk.TclError:
+            pass
+        self._render()                      # 同步迷你窗内容
+
+    def expand(self):
+        """展开迷你小窗，恢复完整主卡。"""
+        if self._mini is None:
+            return
+        mini, self._mini = self._mini, None
+        mini.close()
+        try:
+            self.window.root.deiconify()
+        except tk.TclError:
+            pass
+        self._render()
+
+    def _close_mini(self):
+        """清理迷你窗（退出/测试时调用，幂等）。"""
+        if self._mini is None:
+            return
+        try:
+            self._mini.close()
+        except tk.TclError:
+            pass
+        self._mini = None
+
     def close_app(self):
         """测试用关闭：正常走 Tcl 析构（destroy + mainloop 自然返回）。"""
         self._cancel_tick()
+        self._close_mini()
         if self._todo_panel is not None:
             self._todo_panel.close()
             self._todo_panel = None
@@ -149,6 +198,7 @@ class PomodoroController:
         """
         import os
         self._cancel_tick()
+        self._close_mini()
         if self._todo_panel is not None:
             try:
                 self._todo_panel.close()
@@ -175,10 +225,10 @@ class PomodoroController:
             self._todo_panel = None
 
         mx, my = self.window.root.winfo_x(), self.window.root.winfo_y()
-        x = mx - TODO_PANEL_W - 24
+        x = mx - PANEL_W - 24
         if x < 10:
             x = mx + 340 + 24
-        pos = clamp_to_screen(x, my + 30, TODO_PANEL_W, 430)
+        pos = clamp_to_screen(x, my + 30, PANEL_W, PANEL_H)
 
         self._todo_day = None          # None = 今日（活列表）
         self._todo_panel = TodoView(
@@ -189,6 +239,7 @@ class PomodoroController:
                 on_start=self.todo_start,
                 on_toggle_done=self.todo_toggle_done,
                 on_remove=self.todo_remove,
+                on_edit=self.todo_edit,
                 on_close=self._close_todo_panel,
                 on_prev_day=lambda: self.todo_nav("prev"),
                 on_next_day=lambda: self.todo_nav("next"),
@@ -266,8 +317,8 @@ class PomodoroController:
             self._todo_panel.close()
             self._todo_panel = None
 
-    def todo_add(self, text: str, note: str = ""):
-        if self.todos.add(text, note) is not None:
+    def todo_add(self, text: str, note: str = "", progress: int = 0):
+        if self.todos.add(text, note, progress) is not None:
             self._refresh_panel()
             self._render()
             self._persist()
@@ -301,12 +352,16 @@ class PomodoroController:
         self._persist()
 
     def todo_toggle_done(self, todo_id: str):
-        """标记/撤销完成。标记完成且该任务正计时的专注未结束 → 自动结束计一次。"""
+        """标记/撤销完成。标记完成且该任务正计时的专注未结束 → 自动结束计一次。
+
+        完成度联动：标记完成 → 100%；撤销完成 → 0%（未完成即无进度）。
+        """
         todo = self.todos.get(todo_id)
         if todo is None:
             return
         new_done = not todo.done
         self.todos.set_done(todo_id, new_done)
+        self.todos.set_progress(todo_id, 100 if new_done else 0)
 
         if new_done and self.todos.active_id == todo_id:
             should_end = (self.engine.mode == "focus"
@@ -325,6 +380,14 @@ class PomodoroController:
         self._refresh_panel()
         self._render()
         self._persist()
+
+    def todo_edit(self, todo_id: str, text: str, note: str = "",
+                  progress=None):
+        """编辑条目（标题 + 详情 + 完成度）；标题为空则忽略。刷新面板/主卡并落盘。"""
+        if self.todos.edit(todo_id, text, note, progress) is not None:
+            self._refresh_panel()
+            self._render()
+            self._persist()
 
     # ==================== 统计 ====================
     def open_stats(self):
@@ -425,7 +488,7 @@ class PomodoroController:
         return todo.text if todo and not todo.done else ""
 
     def _render(self):
-        self.view.render(TimerSnapshot(
+        snap = TimerSnapshot(
             mode=self.engine.mode,
             remaining=self.engine.remaining,
             total=self.engine.total,
@@ -434,7 +497,10 @@ class PomodoroController:
             in_set=self.engine.stats.in_set,
             task_title=self._active_task_title(),
             pinned=self.window.topmost,
-        ))
+        )
+        self.view.render(snap)
+        if self._mini is not None:
+            self._mini.render(snap)
 
     def _persist(self):
         """待办走 todos.db（SQLite），其余配置走 config.json。"""

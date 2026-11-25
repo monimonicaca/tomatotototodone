@@ -65,3 +65,15 @@ def to_nonneg_int(value, fallback=0) -> int:
     except (TypeError, ValueError):
         return fallback
     return max(0, n)
+
+
+def clean_progress(value, fallback=0) -> int:
+    """完成度 -> [0, 100] 的整数：超界钳制、坏数据回退，不抛异常。
+
+    接受 "80"、80、80.6 等输入（Spinbox / 旧库 / 手改数据都可能给字符串）。
+    """
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return max(0, min(100, n))

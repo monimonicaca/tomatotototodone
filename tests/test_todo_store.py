@@ -245,8 +245,8 @@ def test_dirty_rows_tolerated(tmp: Path):
 
     conn = sqlite3.connect(str(db))
     with conn:
-        conn.execute("INSERT INTO todos VALUES (?, 'x1', '   ', 0, 0, '', 9)", (D1,))     # 空文本
-        conn.execute("INSERT INTO todos VALUES (?, 'x2', '坏poms', 0, 'zx', '备注', 8)", (D1,))  # 坏poms/带备注
+        conn.execute("INSERT INTO todos VALUES (?, 'x1', '   ', 0, 0, '', 0, 9)", (D1,))     # 空文本
+        conn.execute("INSERT INTO todos VALUES (?, 'x2', '坏poms', 0, 'zx', '备注', 180, 8)", (D1,))  # 坏poms/超界progress
         conn.execute("INSERT OR REPLACE INTO todo_meta VALUES "
                      "('active_id', 'ghost')")
     conn.close()
@@ -255,6 +255,7 @@ def test_dirty_rows_tolerated(tmp: Path):
     store.close()
     assert [t.text for t in tl.items] == ["进行中的任务", "已完成的任务", "坏poms"]
     assert tl.items[2].poms == 0              # 坏 poms 回 0
+    assert tl.items[2].progress == 100        # 超界 progress 钳到 100
     assert tl.active_id is None               # 悬空 active 丢弃
 
 
@@ -266,6 +267,58 @@ def test_days_listing(tmp: Path):
 
     s2 = TodoStore(tmp / "t.db")
     assert s2.days() == [D2, D1]
+    s2.close()
+
+
+def test_v2_schema_adds_progress_column(tmp: Path):
+    """v2 老库（有 note 无 progress）连接时自动补列，进度默认 0、可写回。"""
+    db = tmp / "oldv2p.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE todos (
+            day TEXT NOT NULL, id TEXT NOT NULL, text TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0, poms INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, id));
+        CREATE TABLE todo_meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO todos VALUES ('2026-11-04', 'a1', '旧任务', 0, 2, '旧备注', 0);
+        INSERT INTO todo_meta VALUES ('date', '2026-11-04');
+        INSERT INTO todo_meta VALUES ('active_id', 'a1');
+    """)
+    conn.commit()
+    conn.close()
+
+    store = TodoStore(db)
+    tl = store.load(D1)
+    assert [t.text for t in tl.items] == ["旧任务"]
+    assert tl.items[0].progress == 0                # 补列后进度默认 0
+    assert tl.items[0].note == "旧备注"             # 旧列不受伤
+    tl.items[0].progress = 80
+    store.save(tl)                                   # 写回正常
+    store.close()
+
+    s2 = TodoStore(db)
+    loaded = s2.load(D1)
+    assert loaded.items[0].progress == 80
+    assert loaded.items[0].note == "旧备注"
+    s2.close()
+
+
+def test_progress_roundtrip_and_rollover(tmp: Path):
+    """完成度随当天桶持久化，跨天接班沿用。"""
+    db = tmp / "t.db"
+    store = TodoStore(db)
+    tl = TodoList()
+    tl.date = D1
+    a = tl.add("拉通对齐", "补充说明", progress=80)
+    assert store.save(tl) is True
+    store.close()
+
+    s2 = TodoStore(db)
+    loaded = s2.load(D1)
+    assert loaded.items[0].progress == 80
+    seeded = s2.load(D2)                  # D1 -> D2 跨天接班
+    assert seeded.items[0].progress == 80
     s2.close()
 
 

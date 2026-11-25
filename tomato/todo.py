@@ -11,7 +11,8 @@ import uuid
 from dataclasses import dataclass, field
 
 from .constants import (MAX_TODO_NOTE, MAX_TODO_TEXT, TODO_ACTIVE_KEY,
-                        TODO_DATE_KEY, TODO_ITEMS_KEY, to_nonneg_int)
+                        TODO_DATE_KEY, TODO_ITEMS_KEY, clean_progress,
+                        to_nonneg_int)
 
 
 def clean_text(text) -> str:
@@ -35,11 +36,12 @@ class Todo:
     done: bool = False
     poms: int = 0               # 这条任务累计吃掉的番茄数
     note: str = ""              # 这条任务的详情/备注说明
+    progress: int = 0           # 完成度 0-100（百分比）
 
     @classmethod
-    def make(cls, text: str, note: str = "") -> "Todo":
+    def make(cls, text: str, note: str = "", progress=0) -> "Todo":
         return cls(id=uuid.uuid4().hex[:8], text=clean_text(text),
-                   note=clean_note(note))
+                   note=clean_note(note), progress=clean_progress(progress))
 
 
 @dataclass
@@ -49,12 +51,12 @@ class TodoList:
     active_id: str | None = None
 
     # ---------- 增删改 ----------
-    def add(self, text, note="") -> Todo | None:
+    def add(self, text, note="", progress=0) -> Todo | None:
         """新增待办；文本为空则忽略。首条自动成为当前任务。"""
         t = clean_text(text)
         if not t:
             return None
-        todo = Todo.make(t, note)
+        todo = Todo.make(t, note, progress)
         self.items.append(todo)
         if not self.active_id:
             self.active_id = todo.id
@@ -65,6 +67,31 @@ class TodoList:
             if t.id == todo_id:
                 return t
         return None
+
+    def edit(self, todo_id, text, note="", progress=None) -> Todo | None:
+        """编辑条目（标题 + 详情 + 可选完成度）；标题为空则忽略。
+
+        progress 传 None 表示本次不动完成度（兼容只改文字的旧调用方）。
+        返回被修改的条目或 None。
+        """
+        t = self.get(todo_id)
+        if t is None:
+            return None
+        new_text = clean_text(text)
+        if not new_text:
+            return None
+        t.text = new_text
+        t.note = clean_note(note)
+        if progress is not None:
+            t.progress = clean_progress(progress)
+        return t
+
+    def set_progress(self, todo_id, pct) -> Todo | None:
+        """独立设置完成度（0-100，超界钳制）；不存在条目静默。"""
+        t = self.get(todo_id)
+        if t is not None:
+            t.progress = clean_progress(pct)
+        return t
 
     def remove(self, todo_id):
         """删除条目；删的是当前任务则清空 active_id。"""
@@ -108,7 +135,7 @@ class TodoList:
             TODO_DATE_KEY: self.date,
             TODO_ITEMS_KEY: [
                 {"id": t.id, "text": t.text, "done": t.done,
-                 "poms": t.poms, "note": t.note}
+                 "poms": t.poms, "note": t.note, "progress": t.progress}
                 for t in self.items
             ],
             TODO_ACTIVE_KEY: self.active_id,
@@ -133,7 +160,9 @@ class TodoList:
                 tl.items.append(Todo(id=tid, text=text,
                                      done=bool(it.get("done")),
                                      poms=to_nonneg_int(it.get("poms")),
-                                     note=clean_note(it.get("note"))))
+                                     note=clean_note(it.get("note")),
+                                     progress=clean_progress(
+                                         it.get("progress", 0))))
         aid = data.get(TODO_ACTIVE_KEY)
         tl.active_id = aid if isinstance(aid, str) and tl.get(aid) else None
         return tl
